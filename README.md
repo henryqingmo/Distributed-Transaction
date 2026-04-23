@@ -1,93 +1,157 @@
-# cs425_mp3
+# MP3 Design Document — Distributed Transactions
 
+## Overview
 
+Two-Phase Locking (2PL) for isolation + Two-Phase Commit (2PC) for atomicity.
+These solve different problems: 2PL controls concurrent access during a transaction,
+2PC ensures all-or-nothing commit across servers.
 
-## Getting started
+---
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+## Server Data Structures
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
-
-## Add your files
-
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
-
+### Per-account lock state (on each branch server)
 ```
-cd existing_repo
-git remote add origin https://gitlab.engr.illinois.edu/qingmo2/cs425_mp3.git
-git branch -M main
-git push -uf origin main
+accounts: map[string]Account
+  Account:
+    committedBalance int
+    lockState:
+      mode: UNLOCKED | READ | WRITE
+      holders: []TransactionID      // for read locks (multiple allowed)
+      holder:  TransactionID        // for write lock (exclusive)
+      waitQueue: []WaitEntry        // blocked transactions + their requested mode
 ```
 
-## Integrate with your tools
+### Per-transaction write buffer (on each branch server)
+```
+tentativeWrites: map[TransactionID]map[AccountName]int
+```
+Tentative writes are invisible to other transactions. A transaction reads its own
+write buffer first; if no entry, falls back to committedBalance.
 
-- [ ] [Set up project integrations](https://gitlab.engr.illinois.edu/qingmo2/cs425_mp3/-/settings/integrations)
+### Coordinator state (on the coordinating server, per transaction)
+```
+Transaction:
+  id:           TransactionID
+  timestamp:    int64             // assigned at BEGIN, used for wound-wait
+  participants: []ServerID        // servers contacted so far (grows dynamically)
+  clientConn:   net.Conn
+```
 
-## Collaborate with your team
+---
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+## Locking Protocol (Strict 2PL)
 
-## Test and Deploy
+- **Read lock (BALANCE):** shared — multiple transactions can hold simultaneously
+- **Write lock (DEPOSIT/WITHDRAW):** exclusive — one holder at a time
+- Locks are held until the transaction commits or aborts (strict 2PL)
+- This prevents dirty reads: T2 cannot read uncommitted writes from T1
 
-Use the built-in continuous integration in GitLab.
+### Lock acquisition
+1. Check account's lock state
+2. If compatible (e.g., read + read), grant immediately
+3. If incompatible, apply wound-wait (see below)
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+---
 
-***
+## Deadlock Prevention — Wound-Wait
 
-# Editing this README
+Each transaction receives a timestamp at `BEGIN`. Lower timestamp = older.
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+| Scenario | Action |
+|---|---|
+| Older T1 wants lock held by younger T2 | T1 **wounds** T2 (T2 is aborted) |
+| Younger T2 wants lock held by older T1 | T2 **waits** |
 
-## Suggestions for a good README
+This ensures waiting only goes in one direction (younger→older), making cycles impossible.
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+No timeouts are used (per spec requirement).
 
-## Name
-Choose a self-explaining name for your project.
+### When a transaction is wounded
+- The server holding the lock sends `ABORTED` back to the wounded transaction's coordinator
+- The wounded transaction's coordinator sends `ABORT` to all servers in its participant list
+- Each server clears tentative writes and releases all locks held by that transaction
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+---
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+## Coordinator Responsibilities
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+The client connects to a randomly selected server as coordinator. The client only
+ever talks to the coordinator.
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+The coordinator:
+- Routes each command to the correct branch server (by account prefix)
+- Maintains the participant list (set of servers contacted, grows per command)
+- Handles `COMMIT` and `ABORT` by running 2PC or broadcasting abort
+- For accounts on its own branch: calls local function directly (no network hop)
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+---
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+## Two-Phase Commit (at COMMIT)
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+### Phase 1 — Prepare (vote)
+Coordinator sends `PREPARE` to all participants.
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+Each participant:
+1. Checks that all accounts written during the transaction have non-negative balances
+2. Votes `YES` or `NO`
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+If any participant votes `NO`, coordinator sends `ABORT` to all and replies `ABORTED` to client.
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+### Phase 2 — Commit or Abort
+If all votes are `YES`:
+- Coordinator sends `COMMIT` to all participants
+- Each participant applies tentative writes to committed balances, releases all locks
+- Coordinator replies `COMMIT OK` to client
+- Each server prints balances of all non-zero accounts after committing
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+If any vote is `NO`:
+- Coordinator sends `ABORT` to all participants
+- Each participant clears tentative writes, releases all locks
+- Coordinator replies `ABORTED` to client
 
-## License
-For open source projects, say how it is licensed.
+---
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+## Abort (mid-transaction)
+
+Triggered by: user `ABORT` command, `NOT FOUND` on BALANCE/WITHDRAW, wound-wait, or negative balance at commit.
+
+Steps:
+1. Coordinator sends `ABORT` to all servers in participant list
+2. Each server: delete tentative write buffer for transaction, release all locks
+3. Coordinator replies `ABORTED` to client
+
+---
+
+## Wire Protocol
+
+Coordinator ↔ participant communication over TCP.
+Each message is a line of text (newline-delimited) for simplicity.
+
+Request format (coordinator → participant):
+```
+<txn_id> <command> [args...]
+e.g.: tx42 DEPOSIT foo 10
+      tx42 BALANCE foo
+      tx42 PREPARE
+      tx42 COMMIT
+      tx42 ABORT
+```
+
+Response format (participant → coordinator):
+```
+OK [value]    — success, optional value for BALANCE
+ABORTED       — transaction aborted (wound, not found, etc.)
+YES / NO      — prepare vote
+```
+
+---
+
+## Implementation Order
+
+1. Server data structures (account store, lock table, write buffers)
+2. Lock acquisition/release + wound-wait logic
+3. Single-server transactions (coordinator = participant, no forwarding)
+4. Cross-server forwarding (coordinator routes to remote participants)
+5. 2PC at commit
+6. Client (parse stdin, connect to random server, print responses)
