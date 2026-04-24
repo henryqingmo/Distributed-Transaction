@@ -27,6 +27,7 @@ type Message struct {
 	Operation  Operation
 	Account    string
 	Amount     int
+	Timestamp  int64
 }
 
 type Response struct {

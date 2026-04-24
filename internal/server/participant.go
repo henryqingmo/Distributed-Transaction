@@ -16,16 +16,3 @@ const (
 	VoteYes Vote = iota
 	VoteNo
 )
-
-type ParticipantRequest struct {
-	TxnID   string
-	Command string
-	Account string
-	Amount  int
-}
-
-type ParticipantResponse struct {
-	TxnID   string
-	Status  string
-	Balance int
-}
