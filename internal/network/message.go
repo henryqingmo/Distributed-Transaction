@@ -9,6 +9,7 @@ const (
 	OperationBalance
 	OperationCommit
 	OperationAbort
+	OperationPrepare
 )
 
 type ResponseMessage int
