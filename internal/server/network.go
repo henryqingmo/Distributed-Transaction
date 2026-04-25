@@ -2,6 +2,7 @@ package server
 
 import (
 	"bufio"
+	"cs425_mp3/internal/lock"
 	"fmt"
 	"net"
 	"strconv"
@@ -61,8 +62,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 			if len(fields) < 3 {
 				continue
 			}
-			account := parseAccount(fields[2])
-			response = s.handleBalance(txnID, account)
+			response = s.handleBalance(txnID, fields[2])
 
 		case "PREPARE":
 			response = s.handlePrepare(txnID)
@@ -98,4 +98,98 @@ func parseAccountAmount(fields []string) (string, int, bool) {
 		return "", 0, false
 	}
 	return account, amount, true
+}
+
+func (s *Server) handleDeposit(txnID string, account string, amount int) string {
+	s.mu.Lock()
+	ch := make(chan struct{})
+	result := s.tryAcquireLock(txnID, account, lock.WRITE, ch)
+	if result == "wait" {
+		s.mu.Unlock()
+		<-ch
+		s.mu.Lock()
+	}
+	if s.Transactions[txnID].Aborted {
+		s.mu.Unlock()
+		return "ABORTED"
+	}
+	s.execDeposit(txnID, account, amount)
+	s.mu.Unlock()
+	return "OK"
+}
+
+func (s *Server) handleWithdraw(txnID string, account string, amount int) string {
+	s.mu.Lock()
+	ch := make(chan struct{})
+	result := s.tryAcquireLock(txnID, account, lock.WRITE, ch)
+	if result == "wait" {
+		s.mu.Unlock()
+		<-ch
+		s.mu.Lock()
+	}
+	if s.Transactions[txnID].Aborted {
+		s.mu.Unlock()
+		return "ABORTED"
+	}
+	ok := s.execWithdraw(txnID, account, amount)
+	s.mu.Unlock()
+	if !ok {
+		s.handleAbort(txnID)
+		return "NOT FOUND, ABORTED"
+	}
+	return "OK"
+}
+
+// handleBalance takes the raw "B.foo" account string for response formatting
+func (s *Server) handleBalance(txnID string, rawAccount string) string {
+	account := parseAccount(rawAccount)
+	s.mu.Lock()
+	ch := make(chan struct{})
+	result := s.tryAcquireLock(txnID, account, lock.READ, ch)
+	if result == "wait" {
+		s.mu.Unlock()
+		<-ch
+		s.mu.Lock()
+	}
+	if s.Transactions[txnID].Aborted {
+		s.mu.Unlock()
+		return "ABORTED"
+	}
+	balance, found := s.getBalance(txnID, account)
+	s.mu.Unlock()
+	if !found {
+		s.handleAbort(txnID)
+		return "NOT FOUND, ABORTED"
+	}
+	return fmt.Sprintf("%s = %d", rawAccount, balance)
+}
+
+func (s *Server) handlePrepare(txnID string) string {
+	s.mu.Lock()
+	vote := s.execPrepare(txnID)
+	s.mu.Unlock()
+	if vote == VoteYes {
+		return "YES"
+	}
+	return "NO"
+}
+
+func (s *Server) handleCommit(txnID string) string {
+	s.mu.Lock()
+	s.execCommit(txnID)
+	for account := range s.Transactions[txnID].LockedAccount {
+		s.processWaitQueue(s.Locks[account])
+	}
+	s.mu.Unlock()
+	return "OK"
+}
+
+func (s *Server) handleAbort(txnID string) string {
+	s.mu.Lock()
+	s.execAbort(txnID)
+	for account := range s.Transactions[txnID].LockedAccount {
+		s.processWaitQueue(s.Locks[account])
+	}
+	s.mu.Unlock()
+	return "ABORTED"
 }

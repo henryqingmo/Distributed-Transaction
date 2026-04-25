@@ -15,8 +15,7 @@ type Server struct {
 	Transactions    map[string]*Transaction
 	Participants    map[string]*ParticipantClient
 
-	mu   sync.RWMutex
-	cond *sync.Cond
+	mu sync.Mutex
 }
 
 type Account struct {
@@ -64,13 +63,12 @@ func NewServer(branchID string, cfg ClusterConfig) *Server {
 		TentativeWrites: make(map[string]map[string]int),
 		Transactions:    make(map[string]*Transaction),
 		Participants:    make(map[string]*ParticipantClient)}
-	s.cond = sync.NewCond(&s.mu)
 	return s
 }
 
 // tryAcquireLock attempts to acquire a lock for txnID on account.
 // Returns: "granted", "wait", or "wound"
-func (s *Server) tryAcquireLock(txnID string, account string, mode lock.LockState) string {
+func (s *Server) tryAcquireLock(txnID string, account string, mode lock.LockState, ch chan struct{}) string {
 	acl, exists := s.Locks[account]
 	if !exists {
 		acl = &AccountLock{
@@ -103,7 +101,7 @@ func (s *Server) tryAcquireLock(txnID string, account string, mode lock.LockStat
 			return "wound"
 		}
 		// Requester is younger — wait
-		acl.WaitQueue = append(acl.WaitQueue, WaitEntry{TxnID: txnID, Mode: mode})
+		acl.WaitQueue = append(acl.WaitQueue, WaitEntry{TxnID: txnID, Mode: mode, Ready: ch})
 		return "wait"
 	}
 
@@ -114,7 +112,7 @@ func (s *Server) tryAcquireLock(txnID string, account string, mode lock.LockStat
 
 		if holderTs < requesterTs {
 			//wait
-			acl.WaitQueue = append(acl.WaitQueue, WaitEntry{TxnID: txnID, Mode: mode})
+			acl.WaitQueue = append(acl.WaitQueue, WaitEntry{TxnID: txnID, Mode: mode, Ready: ch})
 			return "wait"
 		}
 
@@ -123,7 +121,7 @@ func (s *Server) tryAcquireLock(txnID string, account string, mode lock.LockStat
 	for key := range acl.ReadHolds {
 		holderTs := s.Transactions[key].Timestamp
 		if holderTs < requesterTs {
-			acl.WaitQueue = append(acl.WaitQueue, WaitEntry{TxnID: txnID, Mode: mode})
+			acl.WaitQueue = append(acl.WaitQueue, WaitEntry{TxnID: txnID, Mode: mode, Ready: ch})
 			return "wait"
 		}
 	}
