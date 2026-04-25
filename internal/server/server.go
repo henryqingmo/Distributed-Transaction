@@ -42,6 +42,7 @@ type Transaction struct {
 	CoordinatorID string
 	Participants  map[string]struct{}
 	Aborted       bool
+	LockedAccount map[string]struct{}
 }
 
 type ClusterConfig map[string]NodeInfo
@@ -84,6 +85,7 @@ func (s *Server) tryAcquireLock(txnID string, account string, mode lock.LockStat
 			// No write hold — grant read immediately
 			acl.ReadHolds[txnID] = struct{}{}
 			acl.State = lock.READ
+			s.Transactions[txnID].LockedAccount[account] = struct{}{}
 			return "granted"
 		}
 		// Write hold exists — wound-wait against holder
@@ -94,6 +96,7 @@ func (s *Server) tryAcquireLock(txnID string, account string, mode lock.LockStat
 			acl.WriteHold = ""
 			acl.ReadHolds[txnID] = struct{}{}
 			acl.State = lock.READ
+			s.Transactions[txnID].LockedAccount[account] = struct{}{}
 			return "wound"
 		}
 		// Requester is younger — wait
@@ -137,6 +140,7 @@ func (s *Server) tryAcquireLock(txnID string, account string, mode lock.LockStat
 
 	acl.WriteHold = txnID
 	acl.State = lock.WRITE
+	s.Transactions[txnID].LockedAccount[account] = struct{}{}
 
 	if wounded {
 		return "wound"
