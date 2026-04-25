@@ -15,7 +15,8 @@ type Server struct {
 	Transactions    map[string]*Transaction
 	Participants    map[string]*ParticipantClient
 
-	mu sync.RWMutex
+	mu   sync.RWMutex
+	cond *sync.Cond
 }
 
 type Account struct {
@@ -34,6 +35,7 @@ type AccountLock struct {
 type WaitEntry struct {
 	TxnID string
 	Mode  lock.LockState
+	Ready chan struct{}
 }
 
 type Transaction struct {
@@ -54,15 +56,16 @@ type NodeInfo struct {
 }
 
 func NewServer(branchID string, cfg ClusterConfig) *Server {
-	return &Server{
+	s := &Server{
 		BranchID:        branchID,
 		Config:          cfg,
 		Accounts:        make(map[string]*Account),
 		Locks:           make(map[string]*AccountLock),
 		TentativeWrites: make(map[string]map[string]int),
 		Transactions:    make(map[string]*Transaction),
-		Participants:    make(map[string]*ParticipantClient),
-	}
+		Participants:    make(map[string]*ParticipantClient)}
+	s.cond = sync.NewCond(&s.mu)
+	return s
 }
 
 // tryAcquireLock attempts to acquire a lock for txnID on account.
@@ -148,4 +151,39 @@ func (s *Server) tryAcquireLock(txnID string, account string, mode lock.LockStat
 
 	return "granted"
 
+}
+
+func (s *Server) processWaitQueue(acl *AccountLock) {
+	if len(acl.WaitQueue) == 0 {
+		return
+	}
+
+	front := acl.WaitQueue[0]
+
+	if front.Mode == lock.WRITE {
+		// Only grant write if no holders remain
+		if acl.WriteHold == "" && len(acl.ReadHolds) == 0 {
+			acl.WaitQueue = acl.WaitQueue[1:]
+			acl.WriteHold = front.TxnID
+			acl.State = lock.WRITE
+			s.Transactions[front.TxnID].LockedAccount[acl.Account] = struct{}{}
+			close(front.Ready)
+		}
+		return
+	}
+
+	// Front wants READ — grant all consecutive READs (no write hold allowed)
+	if acl.WriteHold != "" {
+		return
+	}
+	i := 0
+	for i < len(acl.WaitQueue) && acl.WaitQueue[i].Mode == lock.READ {
+		entry := acl.WaitQueue[i]
+		acl.ReadHolds[entry.TxnID] = struct{}{}
+		acl.State = lock.READ
+		s.Transactions[entry.TxnID].LockedAccount[acl.Account] = struct{}{}
+		close(entry.Ready)
+		i++
+	}
+	acl.WaitQueue = acl.WaitQueue[i:]
 }
