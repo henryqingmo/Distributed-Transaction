@@ -34,48 +34,45 @@ func (s *Server) handleConnection(conn net.Conn) {
 		if len(fields) < 2 {
 			continue
 		}
-
-		txnID := fields[0]
-		op := fields[1]
-
-		var response string
-
-		switch op {
-		case "DEPOSIT":
-			// txnID DEPOSIT branch.account amount
-			account, amount, ok := parseAccountAmount(fields)
-			if !ok {
-				continue
-			}
-			response = s.handleDeposit(txnID, account, amount)
-
-		case "WITHDRAW":
-			// txnID WITHDRAW branch.account amount
-			account, amount, ok := parseAccountAmount(fields)
-			if !ok {
-				continue
-			}
-			response = s.handleWithdraw(txnID, account, amount)
-
-		case "BALANCE":
-			// txnID BALANCE branch.account
-			if len(fields) < 3 {
-				continue
-			}
-			response = s.handleBalance(txnID, fields[2])
-
-		case "PREPARE":
-			response = s.handlePrepare(txnID)
-
-		case "COMMIT":
-			response = s.handleCommit(txnID)
-
-		case "ABORT":
-			response = s.handleAbort(txnID)
+		response, ok := s.routeCommand(fields)
+		if !ok {
+			continue
 		}
-
 		fmt.Fprintln(writer, response)
 		writer.Flush()
+	}
+}
+
+func (s *Server) routeCommand(fields []string) (string, bool) {
+	txnID := fields[0]
+	op := fields[1]
+
+	switch op {
+	case "DEPOSIT":
+		account, amount, ok := parseAccountAmount(fields)
+		if !ok {
+			return "", false
+		}
+		return s.handleDeposit(txnID, account, amount), true
+	case "WITHDRAW":
+		account, amount, ok := parseAccountAmount(fields)
+		if !ok {
+			return "", false
+		}
+		return s.handleWithdraw(txnID, account, amount), true
+	case "BALANCE":
+		if len(fields) < 3 {
+			return "", false
+		}
+		return s.handleBalance(txnID, fields[2]), true
+	case "PREPARE":
+		return s.handlePrepare(txnID), true
+	case "COMMIT":
+		return s.handleCommit(txnID), true
+	case "ABORT":
+		return s.handleAbort(txnID), true
+	default:
+		return "", false
 	}
 }
 
@@ -100,38 +97,37 @@ func parseAccountAmount(fields []string) (string, int, bool) {
 	return account, amount, true
 }
 
-func (s *Server) handleDeposit(txnID string, account string, amount int) string {
-	s.mu.Lock()
+func (s *Server) waitForLockIfNeeded(txnID, account string, mode lock.LockState) bool {
 	ch := make(chan struct{})
-	result := s.tryAcquireLock(txnID, account, lock.WRITE, ch)
-	if result == "wait" {
+	result := s.acquireLock(txnID, account, mode, ch)
+	if result == LockWait {
 		s.mu.Unlock()
 		<-ch
 		s.mu.Lock()
 	}
-	if s.Transactions[txnID].Aborted {
+	return !s.isTxnAborted(txnID)
+}
+
+func (s *Server) handleDeposit(txnID string, account string, amount int) string {
+	s.mu.Lock()
+	s.coordinatorSvc.TrackParticipant(s, txnID, s.BranchID)
+	if !s.waitForLockIfNeeded(txnID, account, lock.WRITE) {
 		s.mu.Unlock()
 		return "ABORTED"
 	}
-	s.execDeposit(txnID, account, amount)
+	s.participantSvc.Deposit(s, txnID, account, amount)
 	s.mu.Unlock()
 	return "OK"
 }
 
 func (s *Server) handleWithdraw(txnID string, account string, amount int) string {
 	s.mu.Lock()
-	ch := make(chan struct{})
-	result := s.tryAcquireLock(txnID, account, lock.WRITE, ch)
-	if result == "wait" {
-		s.mu.Unlock()
-		<-ch
-		s.mu.Lock()
-	}
-	if s.Transactions[txnID].Aborted {
+	s.coordinatorSvc.TrackParticipant(s, txnID, s.BranchID)
+	if !s.waitForLockIfNeeded(txnID, account, lock.WRITE) {
 		s.mu.Unlock()
 		return "ABORTED"
 	}
-	ok := s.execWithdraw(txnID, account, amount)
+	ok := s.participantSvc.Withdraw(s, txnID, account, amount)
 	s.mu.Unlock()
 	if !ok {
 		s.handleAbort(txnID)
@@ -144,18 +140,12 @@ func (s *Server) handleWithdraw(txnID string, account string, amount int) string
 func (s *Server) handleBalance(txnID string, rawAccount string) string {
 	account := parseAccount(rawAccount)
 	s.mu.Lock()
-	ch := make(chan struct{})
-	result := s.tryAcquireLock(txnID, account, lock.READ, ch)
-	if result == "wait" {
-		s.mu.Unlock()
-		<-ch
-		s.mu.Lock()
-	}
-	if s.Transactions[txnID].Aborted {
+	s.coordinatorSvc.TrackParticipant(s, txnID, s.BranchID)
+	if !s.waitForLockIfNeeded(txnID, account, lock.READ) {
 		s.mu.Unlock()
 		return "ABORTED"
 	}
-	balance, found := s.getBalance(txnID, account)
+	balance, found := s.participantSvc.GetBalance(s, txnID, account)
 	s.mu.Unlock()
 	if !found {
 		s.handleAbort(txnID)
@@ -166,7 +156,7 @@ func (s *Server) handleBalance(txnID string, rawAccount string) string {
 
 func (s *Server) handlePrepare(txnID string) string {
 	s.mu.Lock()
-	vote := s.execPrepare(txnID)
+	vote := s.participantSvc.Prepare(s, txnID)
 	s.mu.Unlock()
 	if vote == VoteYes {
 		return "YES"
@@ -176,9 +166,9 @@ func (s *Server) handlePrepare(txnID string) string {
 
 func (s *Server) handleCommit(txnID string) string {
 	s.mu.Lock()
-	s.execCommit(txnID)
-	for account := range s.Transactions[txnID].LockedAccount {
-		s.processWaitQueue(s.Locks[account])
+	releasedAccounts := s.participantSvc.Commit(s, txnID)
+	for _, account := range releasedAccounts {
+		s.processWaitQueue(account)
 	}
 	s.mu.Unlock()
 	return "OK"
@@ -186,9 +176,9 @@ func (s *Server) handleCommit(txnID string) string {
 
 func (s *Server) handleAbort(txnID string) string {
 	s.mu.Lock()
-	s.execAbort(txnID)
-	for account := range s.Transactions[txnID].LockedAccount {
-		s.processWaitQueue(s.Locks[account])
+	releasedAccounts := s.participantSvc.Abort(s, txnID)
+	for _, account := range releasedAccounts {
+		s.processWaitQueue(account)
 	}
 	s.mu.Unlock()
 	return "ABORTED"

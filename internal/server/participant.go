@@ -17,8 +17,14 @@ const (
 	VoteNo
 )
 
-func (s *Server) getBalance(txnID, account string) (int, bool) {
-	if tentative, exists := s.TentativeWrites[txnID][account]; exists {
+type ParticipantService struct{}
+
+func NewParticipantService() *ParticipantService {
+	return &ParticipantService{}
+}
+
+func (p *ParticipantService) GetBalance(s *Server, txnID, account string) (int, bool) {
+	if tentative, exists := s.txnWriteSet(txnID)[account]; exists {
 		return tentative, true
 	}
 	acct, found := s.Accounts[account]
@@ -28,32 +34,28 @@ func (s *Server) getBalance(txnID, account string) (int, bool) {
 	return acct.CommittedBalance, true
 }
 
-func (s *Server) execDeposit(txnID, account string, amount int) {
-	if s.TentativeWrites[txnID] == nil {
-		s.TentativeWrites[txnID] = make(map[string]int)
-	}
-	curr, _ := s.getBalance(txnID, account)
-	s.TentativeWrites[txnID][account] = curr + amount
+func (p *ParticipantService) Deposit(s *Server, txnID, account string, amount int) {
+	writeSet := s.ensureTxnWriteSet(txnID)
+	curr, _ := p.GetBalance(s, txnID, account)
+	writeSet[account] = curr + amount
 }
 
 // Returns false if account not found (triggers abort)
-func (s *Server) execWithdraw(txnID, account string, amount int) bool {
-	curr, found := s.getBalance(txnID, account)
+func (p *ParticipantService) Withdraw(s *Server, txnID, account string, amount int) bool {
+	curr, found := p.GetBalance(s, txnID, account)
 	if !found {
 		return false
 	}
-	if s.TentativeWrites[txnID] == nil {
-		s.TentativeWrites[txnID] = make(map[string]int)
-	}
-	s.TentativeWrites[txnID][account] = curr - amount
+	writeSet := s.ensureTxnWriteSet(txnID)
+	writeSet[account] = curr - amount
 	return true
 }
 
-func (s *Server) execPrepare(txnID string) Vote {
-	if s.Transactions[txnID].Aborted {
+func (p *ParticipantService) Prepare(s *Server, txnID string) Vote {
+	if s.isTxnAborted(txnID) {
 		return VoteNo
 	}
-	for _, balance := range s.TentativeWrites[txnID] {
+	for _, balance := range s.txnWriteSet(txnID) {
 		if balance < 0 {
 			return VoteNo
 		}
@@ -61,8 +63,8 @@ func (s *Server) execPrepare(txnID string) Vote {
 	return VoteYes
 }
 
-func (s *Server) execCommit(txnID string) bool {
-	for account, balance := range s.TentativeWrites[txnID] {
+func (p *ParticipantService) Commit(s *Server, txnID string) []string {
+	for account, balance := range s.txnWriteSet(txnID) {
 
 		if s.Accounts[account] == nil {
 			s.Accounts[account] = &Account{Name: account}
@@ -73,46 +75,12 @@ func (s *Server) execCommit(txnID string) bool {
 	}
 
 	delete(s.TentativeWrites, txnID)
-
-	for account := range s.Transactions[txnID].LockedAccount {
-		actl := s.Locks[account]
-		if actl.WriteHold == txnID {
-			actl.WriteHold = ""
-		}
-		delete(actl.ReadHolds, txnID)
-
-		// delete from waitQueue
-		newWaitQueue := make([]WaitEntry, 0)
-		for _, entry := range actl.WaitQueue {
-			if entry.TxnID != txnID {
-				newWaitQueue = append(newWaitQueue, entry)
-			}
-		}
-		actl.WaitQueue = newWaitQueue
-	}
-
-	return true
+	// returns all the accounts under txnID, aswell as unlocking them
+	return s.releaseTransactionLocks(txnID)
 }
 
-func (s *Server) execAbort(txnID string) bool {
-	// release all locks
-	// remove from queue
-	// remove tentative write
-	for account := range s.Transactions[txnID].LockedAccount {
-		actl := s.Locks[account]
-		if actl.WriteHold == txnID {
-			actl.WriteHold = ""
-		}
-		delete(actl.ReadHolds, txnID)
-
-		newWaitQueue := make([]WaitEntry, 0)
-		for _, entry := range actl.WaitQueue {
-			if entry.TxnID != txnID {
-				newWaitQueue = append(newWaitQueue, entry)
-			}
-		}
-		actl.WaitQueue = newWaitQueue
-	}
+func (p *ParticipantService) Abort(s *Server, txnID string) []string {
+	s.markTxnAborted(txnID)
 	delete(s.TentativeWrites, txnID)
-	return true
+	return s.releaseTransactionLocks(txnID)
 }
