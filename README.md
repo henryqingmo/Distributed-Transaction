@@ -1,157 +1,63 @@
-# MP3 Design Document — Distributed Transactions
+# MP3 — Distributed Transactions
 
-## Overview
+Two-phase locking (2PL) for isolation and two-phase commit (2PC) for atomicity across branch servers.
 
-Two-Phase Locking (2PL) for isolation + Two-Phase Commit (2PC) for atomicity.
-These solve different problems: 2PL controls concurrent access during a transaction,
-2PC ensures all-or-nothing commit across servers.
+## Build
 
----
-
-## Server Data Structures
-
-### Per-account lock state (on each branch server)
-```
-accounts: map[string]Account
-  Account:
-    committedBalance int
-    lockState:
-      mode: UNLOCKED | READ | WRITE
-      holders: []TransactionID      // for read locks (multiple allowed)
-      holder:  TransactionID        // for write lock (exclusive)
-      waitQueue: []WaitEntry        // blocked transactions + their requested mode
+```bash
+make
 ```
 
-### Per-transaction write buffer (on each branch server)
-```
-tentativeWrites: map[TransactionID]map[AccountName]int
-```
-Tentative writes are invisible to other transactions. A transaction reads its own
-write buffer first; if no entry, falls back to committedBalance.
+Produces `mp3/server` and `mp3/client`.
 
-### Coordinator state (on the coordinating server, per transaction)
+## Config file
+
+Each line names a branch and its host/port:
+
 ```
-Transaction:
-  id:           TransactionID
-  timestamp:    int64             // assigned at BEGIN, used for wound-wait
-  participants: []ServerID        // servers contacted so far (grows dynamically)
-  clientConn:   net.Conn
+A sp26-cs425-3701.cs.illinois.edu 1234
+B sp26-cs425-3702.cs.illinois.edu 1234
+C sp26-cs425-3703.cs.illinois.edu 1234
+D sp26-cs425-3704.cs.illinois.edu 1234
+E sp26-cs425-3705.cs.illinois.edu 1234
 ```
 
----
+## Running a server
 
-## Locking Protocol (Strict 2PL)
-
-- **Read lock (BALANCE):** shared — multiple transactions can hold simultaneously
-- **Write lock (DEPOSIT/WITHDRAW):** exclusive — one holder at a time
-- Locks are held until the transaction commits or aborts (strict 2PL)
-- This prevents dirty reads: T2 cannot read uncommitted writes from T1
-
-### Lock acquisition
-1. Check account's lock state
-2. If compatible (e.g., read + read), grant immediately
-3. If incompatible, apply wound-wait (see below)
-
----
-
-## Deadlock Prevention — Wound-Wait
-
-Each transaction receives a timestamp at `BEGIN`. Lower timestamp = older.
-
-| Scenario | Action |
-|---|---|
-| Older T1 wants lock held by younger T2 | T1 **wounds** T2 (T2 is aborted) |
-| Younger T2 wants lock held by older T1 | T2 **waits** |
-
-This ensures waiting only goes in one direction (younger→older), making cycles impossible.
-
-No timeouts are used (per spec requirement).
-
-### When a transaction is wounded
-- The server holding the lock sends `ABORTED` back to the wounded transaction's coordinator
-- The wounded transaction's coordinator sends `ABORT` to all servers in its participant list
-- Each server clears tentative writes and releases all locks held by that transaction
-
----
-
-## Coordinator Responsibilities
-
-The client connects to a randomly selected server as coordinator. The client only
-ever talks to the coordinator.
-
-The coordinator:
-- Routes each command to the correct branch server (by account prefix)
-- Maintains the participant list (set of servers contacted, grows per command)
-- Handles `COMMIT` and `ABORT` by running 2PC or broadcasting abort
-- For accounts on its own branch: calls local function directly (no network hop)
-
----
-
-## Two-Phase Commit (at COMMIT)
-
-### Phase 1 — Prepare (vote)
-Coordinator sends `PREPARE` to all participants.
-
-Each participant:
-1. Checks that all accounts written during the transaction have non-negative balances
-2. Votes `YES` or `NO`
-
-If any participant votes `NO`, coordinator sends `ABORT` to all and replies `ABORTED` to client.
-
-### Phase 2 — Commit or Abort
-If all votes are `YES`:
-- Coordinator sends `COMMIT` to all participants
-- Each participant applies tentative writes to committed balances, releases all locks
-- Coordinator replies `COMMIT OK` to client
-- Each server prints balances of all non-zero accounts after committing
-
-If any vote is `NO`:
-- Coordinator sends `ABORT` to all participants
-- Each participant clears tentative writes, releases all locks
-- Coordinator replies `ABORTED` to client
-
----
-
-## Abort (mid-transaction)
-
-Triggered by: user `ABORT` command, `NOT FOUND` on BALANCE/WITHDRAW, wound-wait, or negative balance at commit.
-
-Steps:
-1. Coordinator sends `ABORT` to all servers in participant list
-2. Each server: delete tentative write buffer for transaction, release all locks
-3. Coordinator replies `ABORTED` to client
-
----
-
-## Wire Protocol
-
-Coordinator ↔ participant communication over TCP.
-Each message is a line of text (newline-delimited) for simplicity.
-
-Request format (coordinator → participant):
-```
-<txn_id> <command> [args...]
-e.g.: tx42 DEPOSIT foo 10
-      tx42 BALANCE foo
-      tx42 PREPARE
-      tx42 COMMIT
-      tx42 ABORT
+```bash
+./mp3/server <branch> <config>
+# e.g.
+./mp3/server A config.txt
 ```
 
-Response format (participant → coordinator):
+Start one process per branch. Each server listens on the port from the config file.
+
+## Running the client
+
+```bash
+./mp3/client <id> <config>
+# e.g.
+./mp3/client foo config.txt
 ```
-OK [value]    — success, optional value for BALANCE
-ABORTED       — transaction aborted (wound, not found, etc.)
-YES / NO      — prepare vote
+
+The client connects to a randomly selected server as coordinator and reads commands from stdin.
+
+### Client commands
+
+```
+BEGIN
+DEPOSIT <branch>.<account> <amount>
+WITHDRAW <branch>.<account> <amount>
+BALANCE <branch>.<account>
+COMMIT
+ABORT
 ```
 
----
+## Local test
 
-## Implementation Order
+```bash
+cd sample_test
+./run.sh
+```
 
-1. Server data structures (account store, lock table, write buffers)
-2. Lock acquisition/release + wound-wait logic
-3. Single-server transactions (coordinator = participant, no forwarding)
-4. Cross-server forwarding (coordinator routes to remote participants)
-5. 2PC at commit
-6. Client (parse stdin, connect to random server, print responses)
+Starts five servers on ports 10001–10005, runs two test cases, and diffs output against expected results.
