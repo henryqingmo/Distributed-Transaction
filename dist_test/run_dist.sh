@@ -14,7 +14,7 @@ run_test() {
     local input=$2
     local expected=$3
     local actual
-    actual=$("$CLIENT" 1 "$CONFIG" < "$input" 2>/dev/null)
+    actual=$("$CLIENT" 1 "$CONFIG" < "$input" 2>&1)
     if diff -q <(echo "$actual") "$expected" > /dev/null 2>&1; then
         echo "[PASS] $name"
         PASS=$((PASS+1))
@@ -30,6 +30,19 @@ run_test() {
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
+echo "=== Checking servers are reachable ==="
+while IFS= read -r line; do
+    branch=$(echo "$line" | awk '{print $1}')
+    host=$(echo "$line" | awk '{print $2}')
+    port=$(echo "$line" | awk '{print $3}')
+    if nc -z -w2 "$host" "$port" 2>/dev/null; then
+        echo "  [UP]   $branch @ $host:$port"
+    else
+        echo "  [DOWN] $branch @ $host:$port  <-- server not reachable!"
+    fi
+done < "$CONFIG"
+echo ""
+
 echo "=== Sequential Tests ==="
 
 run_test "t1: basic deposit/balance/commit across branches" \
@@ -44,9 +57,9 @@ run_test "t3: negative balance at commit -> ABORTED" \
 echo ""
 echo "=== Concurrent Non-Conflicting Transactions (should both succeed) ==="
 
-"$CLIENT" 2 "$CONFIG" < "$DIR/t4_concurrent_noconflict_c1.txt" > /tmp/t4_c1_out.txt 2>/dev/null &
+"$CLIENT" 2 "$CONFIG" < "$DIR/t4_concurrent_noconflict_c1.txt" > /tmp/t4_c1_out.txt 2>&1 &
 PID1=$!
-"$CLIENT" 3 "$CONFIG" < "$DIR/t4_concurrent_noconflict_c2.txt" > /tmp/t4_c2_out.txt 2>/dev/null &
+"$CLIENT" 3 "$CONFIG" < "$DIR/t4_concurrent_noconflict_c2.txt" > /tmp/t4_c2_out.txt 2>&1 &
 PID2=$!
 wait $PID1 $PID2
 
@@ -65,11 +78,11 @@ echo ""
 echo "=== Deadlock Test (one commits, one aborts) ==="
 
 # First set up the accounts used in deadlock test
-"$CLIENT" 4 "$CONFIG" < "$DIR/t5_deadlock_setup.txt" > /dev/null 2>/dev/null
+"$CLIENT" 4 "$CONFIG" < "$DIR/t5_deadlock_setup.txt" > /dev/null 2>&1
 
-"$CLIENT" 5 "$CONFIG" < "$DIR/t5_deadlock_c1.txt" > /tmp/t5_c1_out.txt 2>/dev/null &
+"$CLIENT" 5 "$CONFIG" < "$DIR/t5_deadlock_c1.txt" > /tmp/t5_c1_out.txt 2>&1 &
 PID1=$!
-"$CLIENT" 6 "$CONFIG" < "$DIR/t5_deadlock_c2.txt" > /tmp/t5_c2_out.txt 2>/dev/null &
+"$CLIENT" 6 "$CONFIG" < "$DIR/t5_deadlock_c2.txt" > /tmp/t5_c2_out.txt 2>&1 &
 PID2=$!
 wait $PID1 $PID2
 
