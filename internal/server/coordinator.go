@@ -198,7 +198,66 @@ func (s *Server) handleClientSession(conn net.Conn, scanner *bufio.Scanner, writ
 	}
 }
 
-// runTwoPhaseCommit is implemented in Section 6.
 func (s *Server) runTwoPhaseCommit(txnID string, participants map[string]bool, pconns map[string]*participantConn) string {
+	// Snapshot branch→conn pairs before spawning goroutines to avoid
+	// concurrent reads/writes on the pconns map.
+	type target struct {
+		branch string
+		pc     *participantConn // nil means own branch (call locally)
+	}
+	targets := make([]target, 0, len(participants))
+	for branch := range participants {
+		if branch == s.BranchID {
+			targets = append(targets, target{branch: branch, pc: nil})
+		} else {
+			targets = append(targets, target{branch: branch, pc: pconns[branch]})
+		}
+	}
+
+	// Phase 1 — PREPARE in parallel
+	type voteResult struct {
+		branch string
+		yes    bool
+	}
+	votes := make(chan voteResult, len(targets))
+	for _, t := range targets {
+		t := t
+		go func() {
+			if t.pc == nil {
+				v := s.handlePrepare(txnID)
+				votes <- voteResult{branch: t.branch, yes: v == "YES"}
+			} else {
+				resp, err := sendRecv(t.pc, fmt.Sprintf("%s PREPARE", txnID))
+				votes <- voteResult{branch: t.branch, yes: err == nil && resp == "YES"}
+			}
+		}()
+	}
+
+	allYes := true
+	for range targets {
+		if v := <-votes; !v.yes {
+			allYes = false
+		}
+	}
+
+	// Phase 2 — COMMIT or ABORT (sequential, participants never block here)
+	if allYes {
+		for _, t := range targets {
+			if t.pc == nil {
+				s.handleCommit(txnID)
+			} else {
+				sendRecv(t.pc, fmt.Sprintf("%s COMMIT", txnID))
+			}
+		}
+		return "COMMIT OK"
+	}
+
+	for _, t := range targets {
+		if t.pc == nil {
+			s.handleAbort(txnID)
+		} else {
+			sendRecv(t.pc, fmt.Sprintf("%s ABORT", txnID))
+		}
+	}
 	return "ABORTED"
 }
