@@ -1,6 +1,6 @@
-A sp26-cs425-0101.cs.illinois.edu 1234  
-B sp26-cs425-0102.cs.illinois.edu 1234  
-C sp26-cs425-0103.cs.illinois.edu 1234  
-D sp26-cs425-0104.cs.illinois.edu 1234  
-E sp26-cs425-0105.cs.illinois.edu 1234  
+A sp26-cs425-3701.cs.illinois.edu 1234  
+B sp26-cs425-3702.cs.illinois.edu 1234  
+C sp26-cs425-3703.cs.illinois.edu 1234  
+D sp26-cs425-3704.cs.illinois.edu 1234  
+E sp26-cs425-3705.cs.illinois.edu 1234  
 
