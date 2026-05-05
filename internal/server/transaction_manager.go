@@ -1,5 +1,38 @@
 package server
 
+import (
+	"strconv"
+	"strings"
+)
+
+// txnID format: "txn:<unixnano>" — coordinator embeds timestamp so all
+// participants agree on transaction age for wound-wait without extra messages.
+func parseTimestampFromTxnID(txnID string) int64 {
+	idx := strings.LastIndex(txnID, ":")
+	if idx == -1 {
+		return 0
+	}
+	ts, _ := strconv.ParseInt(txnID[idx+1:], 10, 64)
+	return ts
+}
+
+func (s *Server) createTransaction(txnID string, timestamp int64) {
+	s.Transactions[txnID] = &Transaction{
+		ID:            txnID,
+		Timestamp:     timestamp,
+		Participants:  make(map[string]struct{}),
+		LockedAccount: make(map[string]struct{}),
+	}
+}
+
+// ensureTransaction creates a Transaction record the first time a participant
+// sees a txnID forwarded from a coordinator. Timestamp is parsed from the ID.
+func (s *Server) ensureTransaction(txnID string) {
+	if _, ok := s.Transactions[txnID]; !ok {
+		s.createTransaction(txnID, parseTimestampFromTxnID(txnID))
+	}
+}
+
 func (s *Server) getTransaction(txnID string) (*Transaction, bool) {
 	txn, ok := s.Transactions[txnID]
 	return txn, ok

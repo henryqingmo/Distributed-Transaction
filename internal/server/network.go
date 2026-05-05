@@ -110,6 +110,7 @@ func (s *Server) waitForLockIfNeeded(txnID, account string, mode lock.LockState)
 
 func (s *Server) handleDeposit(txnID string, account string, amount int) string {
 	s.mu.Lock()
+	s.ensureTransaction(txnID)
 	s.coordinatorSvc.TrackParticipant(s, txnID, s.BranchID)
 	if !s.waitForLockIfNeeded(txnID, account, lock.WRITE) {
 		s.mu.Unlock()
@@ -122,6 +123,7 @@ func (s *Server) handleDeposit(txnID string, account string, amount int) string 
 
 func (s *Server) handleWithdraw(txnID string, account string, amount int) string {
 	s.mu.Lock()
+	s.ensureTransaction(txnID)
 	s.coordinatorSvc.TrackParticipant(s, txnID, s.BranchID)
 	if !s.waitForLockIfNeeded(txnID, account, lock.WRITE) {
 		s.mu.Unlock()
@@ -140,6 +142,7 @@ func (s *Server) handleWithdraw(txnID string, account string, amount int) string
 func (s *Server) handleBalance(txnID string, rawAccount string) string {
 	account := parseAccount(rawAccount)
 	s.mu.Lock()
+	s.ensureTransaction(txnID)
 	s.coordinatorSvc.TrackParticipant(s, txnID, s.BranchID)
 	if !s.waitForLockIfNeeded(txnID, account, lock.READ) {
 		s.mu.Unlock()
