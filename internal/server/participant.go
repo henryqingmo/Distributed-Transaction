@@ -1,5 +1,7 @@
 package server
 
+import "fmt"
+
 type ParticipantClient struct {
 	BranchID string
 	Address  string
@@ -65,17 +67,19 @@ func (p *ParticipantService) Prepare(s *Server, txnID string) Vote {
 
 func (p *ParticipantService) Commit(s *Server, txnID string) []string {
 	for account, balance := range s.txnWriteSet(txnID) {
-
 		if s.Accounts[account] == nil {
 			s.Accounts[account] = &Account{Name: account}
 		}
-
 		s.Accounts[account].CommittedBalance = balance
+	}
 
+	for account, acct := range s.Accounts {
+		if acct.CommittedBalance != 0 {
+			fmt.Printf("%s.%s = %d\n", s.BranchID, account, acct.CommittedBalance)
+		}
 	}
 
 	delete(s.TentativeWrites, txnID)
-	// returns all the accounts under txnID, aswell as unlocking them
 	return s.releaseTransactionLocks(txnID)
 }
 
