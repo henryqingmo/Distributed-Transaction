@@ -28,19 +28,38 @@ func (s *Server) handleConnection(conn net.Conn) {
 	writer := bufio.NewWriter(conn)
 	scanner := bufio.NewScanner(conn)
 
-	for scanner.Scan() {
-		line := scanner.Text()
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			continue
-		}
-		response, ok := s.routeCommand(fields)
-		if !ok {
-			continue
-		}
-		fmt.Fprintln(writer, response)
-		writer.Flush()
+	if !scanner.Scan() {
+		return
 	}
+	firstLine := scanner.Text()
+	fields := strings.Fields(firstLine)
+	if len(fields) == 0 {
+		return
+	}
+
+	if fields[0] == "BEGIN" {
+		s.handleClientSession(conn, scanner, writer)
+		return
+	}
+
+	// participant path: first line is already consumed, process it then loop
+	s.handleParticipantLine(firstLine, writer)
+	for scanner.Scan() {
+		s.handleParticipantLine(scanner.Text(), writer)
+	}
+}
+
+func (s *Server) handleParticipantLine(line string, writer *bufio.Writer) {
+	fields := strings.Fields(line)
+	if len(fields) < 2 {
+		return
+	}
+	response, ok := s.routeCommand(fields)
+	if !ok {
+		return
+	}
+	fmt.Fprintln(writer, response)
+	writer.Flush()
 }
 
 func (s *Server) routeCommand(fields []string) (string, bool) {
